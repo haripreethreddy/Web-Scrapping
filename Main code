@@ -1,0 +1,504 @@
+import requests
+from bs4 import BeautifulSoup
+import csv
+import logging
+import os
+import sys
+import time
+from typing import List, Dict, Optional, Tuple
+from urllib.parse import urljoin, urlparse
+from datetime import datetime
+
+# Configure logging with both file and console output
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'web_scraper_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+class NewsScraper:
+    """
+    A flexible and robust web scraper for extracting news articles from various websites.
+    
+    This class handles HTTP requests, HTML parsing, data extraction, and CSV output
+    with comprehensive error handling and logging.
+    
+    Attributes:
+        base_url (str): The base URL to scrape
+        output_file (str): CSV file to save the scraped data
+        timeout (int): Request timeout in seconds
+        max_retries (int): Maximum number of retry attempts for failed requests
+        retry_delay (float): Delay between retry attempts in seconds
+    """
+    
+    def __init__(self, base_url: str, output_file: str = "scraped_news.csv", 
+                 timeout: int = 10, max_retries: int = 3, retry_delay: float = 2.0):
+        """
+        Initialize the NewsScraper with configuration parameters.
+        
+        Args:
+            base_url (str): URL to scrape
+            output_file (str): Output CSV filename
+            timeout (int): Request timeout in seconds
+            max_retries (int): Maximum number of retry attempts for failed requests
+            retry_delay (float): Delay between retry attempts in seconds
+        """
+        self.base_url = base_url
+        self.output_file = output_file
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        
+        # Configure HTTP headers to simulate a real browser
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0'
+        }
+        
+        # Initialize a session for connection pooling and persistent headers
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        
+        logger.info(f"Initialized NewsScraper for {base_url}")
+    
+    
+    def fetch_page(self, url: str) -> Tuple[Optional[BeautifulSoup], int]:
+        """
+        Fetch and parse a web page with retry logic and comprehensive error handling.
+        
+        Args:
+            url (str): URL to fetch
+            
+        Returns:
+            Tuple containing:
+                - BeautifulSoup object if successful, None otherwise
+                - HTTP status code of the final response
+        """
+        retries = 0
+        status_code = 0
+        
+        while retries <= self.max_retries:
+            try:
+                logger.info(f"Fetching URL: {url} (attempt {retries + 1}/{self.max_retries + 1})")
+                response = self.session.get(url, timeout=self.timeout)
+                status_code = response.status_code
+                response.raise_for_status()  # Raise exception for HTTP errors
+                
+                # Check if content type is HTML before parsing
+                content_type = response.headers.get('content-type', '')
+                if 'text/html' not in content_type:
+                    logger.warning(f"Unexpected content type: {content_type} for URL: {url}")
+                    # We'll still try to parse it, but log the warning
+                
+                # Parse the HTML content with lxml parser for better performance
+                soup = BeautifulSoup(response.content, 'lxml')
+                logger.info(f"Successfully fetched and parsed URL: {url}")
+                return soup, status_code
+                
+            except requests.exceptions.Timeout:
+                logger.error(f"Timeout error for URL: {url}")
+                if retries < self.max_retries:
+                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                
+            except requests.exceptions.ConnectionError:
+                logger.error(f"Connection error for URL: {url}")
+                if retries < self.max_retries:
+                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                
+            except requests.exceptions.HTTPError as e:
+                logger.error(f"HTTP error {e.response.status_code} for URL: {url}")
+                # Don't retry on client errors (4xx) except for 429 (Too Many Requests)
+                if e.response.status_code == 429 and retries < self.max_retries:
+                    logger.info(f"Too Many Requests. Retrying in {self.retry_delay * 2} seconds...")
+                    time.sleep(self.retry_delay * 2)
+                else:
+                    return None, status_code
+                
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request exception for URL: {url}: {str(e)}")
+                if retries < self.max_retries:
+                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                
+            except Exception as e:
+                logger.error(f"Unexpected error fetching {url}: {str(e)}")
+                if retries < self.max_retries:
+                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+            
+            retries += 1
+        
+        logger.error(f"Failed to fetch URL after {self.max_retries + 1} attempts: {url}")
+        return None, status_code
+    
+    
+    def extract_articles_indiatoday(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        """
+        Extract articles from India Today website with robust error handling.
+        
+        Args:
+            soup (BeautifulSoup): Parsed HTML content
+            
+        Returns:
+            List of dictionaries containing article data with keys:
+                - headline: Article headline
+                - content: Article content summary
+                - link: Full URL to the article
+                - timestamp: When the article was scraped
+        """
+        articles = []
+        
+        try:
+            # Find all article elements using multiple possible selectors for robustness
+            article_selectors = ['article', '.story-card', '.news-item', '.story-grid']
+            article_elements = []
+            
+            for selector in article_selectors:
+                elements = soup.select(selector)
+                if elements:
+                    article_elements = elements
+                    logger.info(f"Found {len(article_elements)} articles using selector: {selector}")
+                    break
+            
+            if not article_elements:
+                logger.warning("No articles found using standard selectors. Trying fallback approach.")
+                # Fallback: look for any elements that might contain articles
+                heading_elements = soup.find_all(['h2', 'h3'], class_=True)
+                for heading in heading_elements:
+                    parent = heading.find_parent()
+                    if parent and parent not in article_elements:
+                        article_elements.append(parent)
+                logger.info(f"Found {len(article_elements)} articles using fallback approach")
+            
+            for idx, article in enumerate(article_elements):
+                try:
+                    # Extract headline with multiple fallback strategies
+                    headline = None
+                    headline_selectors = [
+                        'h2 a', 'h3 a', 'h2', 'h3',  # Primary selectors
+                        '.headline', '.title', '[data-testid="headline"]',  # Class-based selectors
+                        'a > h2', 'a > h3'  # Parent-child selectors
+                    ]
+                    
+                    for selector in headline_selectors:
+                        headline_elem = article.select_one(selector)
+                        if headline_elem:
+                            headline = headline_elem.get_text(strip=True)
+                            if headline:
+                                break
+                    
+                    if not headline:
+                        logger.warning(f"No headline found in article {idx + 1}")
+                        continue
+                    
+                    # Extract content with multiple fallback strategies
+                    content = "Content not available"
+                    content_selectors = [
+                        'div.B1S3_story__shortcont__inicf p',  # India Today specific
+                        '.summary', '.excerpt', '.content p', '.description', '.lead',
+                        'p:not([class])',  # Plain paragraph as last resort
+                    ]
+                    
+                    for selector in content_selectors:
+                        content_elem = article.select_one(selector)
+                        if content_elem:
+                            content_text = content_elem.get_text(strip=True)
+                            if content_text:
+                                content = content_text
+                                break
+                    
+                    # Extract article link
+                    link = ""
+                    link_selectors = ['a', 'h2 a', 'h3 a', '.read-more']
+                    
+                    for selector in link_selectors:
+                        link_elem = article.select_one(selector)
+                        if link_elem and link_elem.get('href'):
+                            href = link_elem.get('href')
+                            link = urljoin(self.base_url, href)
+                            break
+                    
+                    # Add article to results
+                    articles.append({
+                        'headline': headline,
+                        'content': content,
+                        'link': link,
+                        'timestamp': datetime.now().isoformat(),
+                        'source': 'India Today'
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Error extracting article {idx + 1}: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"Error in extract_articles_indiatoday: {str(e)}")
+            # Try to extract whatever we can with a more generic approach
+            try:
+                fallback_articles = self.extract_articles_generic(soup)
+                articles.extend(fallback_articles)
+            except Exception as fallback_error:
+                logger.error(f"Fallback extraction also failed: {str(fallback_error)}")
+            
+        return articles
+    
+    
+    def extract_articles_generic(self, soup: BeautifulSoup) -> List[Dict[str, str]]:
+        """
+        Generic article extraction method for other websites with multiple fallback strategies.
+        
+        Args:
+            soup (BeautifulSoup): Parsed HTML content
+            
+        Returns:
+            List of dictionaries containing article data
+        """
+        articles = []
+        
+        try:
+            # Common selectors for news articles across different websites
+            selectors = [
+                'article',                          # Standard HTML5 article element
+                '.article', '.post', '.news-item',  # Common class names
+                '.story', '.card',                  # Additional common patterns
+                '[data-testid="story"]',            # Data attribute selectors
+                '[role="article"]'                  # ARIA role selector
+            ]
+            
+            for selector in selectors:
+                elements = soup.select(selector)
+                if elements:
+                    logger.info(f"Found {len(elements)} elements with selector: {selector}")
+                    
+                    for element in elements:
+                        try:
+                            # Try multiple headline selectors
+                            headline = None
+                            headline_selectors = [
+                                'h1', 'h2', 'h3',                    # Heading elements
+                                '.headline', '.title', '.news-title', # Class-based selectors
+                                '[data-testid="headline"]',           # Data attribute selectors
+                                'a > h2', 'a > h3'                   # Nested patterns
+                            ]
+                            
+                            for h_selector in headline_selectors:
+                                h_elem = element.select_one(h_selector)
+                                if h_elem:
+                                    headline_text = h_elem.get_text(strip=True)
+                                    if headline_text:
+                                        headline = headline_text
+                                        break
+                            
+                            if not headline:
+                                continue  # Skip if no headline found
+                            
+                            # Try multiple content selectors
+                            content = "Content not available"
+                            content_selectors = [
+                                '.summary', '.excerpt', '.content p', 
+                                '.description', '.lead', '.article-body',
+                                '[data-testid="summary"]', 'p:not([class])'
+                            ]
+                            
+                            for c_selector in content_selectors:
+                                c_elem = element.select_one(c_selector)
+                                if c_elem:
+                                    content_text = c_elem.get_text(strip=True)
+                                    if content_text:
+                                        content = content_text
+                                        break
+                            
+                            # Try to find link
+                            link = ""
+                            link_selectors = ['a', 'h2 a', 'h3 a', '.read-more', '[href]']
+                            
+                            for l_selector in link_selectors:
+                                link_elem = element.select_one(l_selector)
+                                if link_elem and link_elem.get('href'):
+                                    href = link_elem.get('href')
+                                    if href and not href.startswith(('javascript:', 'mailto:', 'tel:')):
+                                        link = urljoin(self.base_url, href)
+                                        break
+                            
+                            # Extract domain for source identification
+                            domain = urlparse(self.base_url).netloc
+                            
+                            articles.append({
+                                'headline': headline,
+                                'content': content,
+                                'link': link,
+                                'timestamp': datetime.now().isoformat(),
+                                'source': domain
+                            })
+                            
+                        except Exception as e:
+                            logger.warning(f"Error extracting generic article: {str(e)}")
+                            continue
+                    
+                    break  # Stop after finding articles with one selector
+                
+        except Exception as e:
+            logger.error(f"Error in extract_articles_generic: {str(e)}")
+            
+        return articles
+    
+    
+    def save_to_csv(self, articles: List[Dict[str, str]]) -> bool:
+        """
+        Save articles to CSV file with error handling and file management.
+        
+        Args:
+            articles (List[Dict]): List of article dictionaries
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not articles:
+            logger.warning("No articles to save")
+            return False
+            
+        try:
+            # Check if file exists to determine if we need headers
+            file_exists = os.path.isfile(self.output_file)
+            
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(os.path.abspath(self.output_file)), exist_ok=True)
+            
+            with open(self.output_file, 'a', newline='', encoding='utf-8') as csvfile:
+                fieldnames = ['headline', 'content', 'link', 'timestamp', 'source']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                if not file_exists:
+                    writer.writeheader()
+                    logger.info(f"Created new CSV file: {self.output_file}")
+                
+                for article in articles:
+                    writer.writerow(article)
+                    
+            logger.info(f"Successfully saved {len(articles)} articles to {self.output_file}")
+            return True
+            
+        except IOError as e:
+            logger.error(f"I/O error saving to CSV: {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error saving to CSV: {str(e)}")
+            
+        return False
+    
+    
+    def scrape(self, max_pages: int = 1, delay: float = 1.0) -> bool:
+        """
+        Main scraping method with pagination support and comprehensive error handling.
+        
+        Args:
+            max_pages (int): Maximum number of pages to scrape
+            delay (float): Delay between requests in seconds
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        total_articles = 0
+        success = True
+        
+        try:
+            # Determine extraction method based on URL domain
+            domain = urlparse(self.base_url).netloc.lower()
+            
+            for page in range(1, max_pages + 1):
+                logger.info(f"Scraping page {page}/{max_pages}")
+                
+                # Handle pagination
+                if page > 1:
+                    # Different strategies for different sites
+                    if 'indiatoday' in domain:
+                        url = f"{self.base_url.rstrip('/')}/page/{page}"
+                    else:
+                        # Generic pagination approach
+                        url = f"{self.base_url.rstrip('/')}?page={page}"
+                else:
+                    url = self.base_url
+                
+                # Fetch the page
+                soup, status_code = self.fetch_page(url)
+                if not soup:
+                    logger.warning(f"Failed to fetch page {page}, skipping")
+                    success = False
+                    continue
+                
+                # Choose extraction method based on domain
+                if 'indiatoday' in domain:
+                    articles = self.extract_articles_indiatoday(soup)
+                else:
+                    articles = self.extract_articles_generic(soup)
+                
+                # Save articles if any were found
+                if articles:
+                    if self.save_to_csv(articles):
+                        total_articles += len(articles)
+                        logger.info(f"Saved {len(articles)} articles from page {page}")
+                    else:
+                        logger.error(f"Failed to save articles from page {page}")
+                        success = False
+                else:
+                    logger.warning(f"No articles found on page {page}")
+                
+                # Respectful delay between requests
+                if page < max_pages:
+                    logger.info(f"Waiting {delay} seconds before next request...")
+                    time.sleep(delay)
+            
+            logger.info(f"Scraping completed. Total articles saved: {total_articles}")
+            return success
+            
+        except KeyboardInterrupt:
+            logger.info("Scraping interrupted by user")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during scraping: {str(e)}")
+            return False
+
+
+def main():
+    """Main function to run the scraper with command line argument support."""
+    import argparse
+    
+    # Set up command line argument parsing
+    parser = argparse.ArgumentParser(description='Scrape news articles from a website')
+    parser.add_argument('url', help='URL to scrape', nargs='?', default="https://www.indiatoday.in/india")
+    parser.add_argument('-o', '--output', help='Output CSV file', default='scraped_news.csv')
+    parser.add_argument('-p', '--pages', help='Number of pages to scrape', type=int, default=1)
+    parser.add_argument('-d', '--delay', help='Delay between requests in seconds', type=float, default=1.0)
+    parser.add_argument('-t', '--timeout', help='Request timeout in seconds', type=int, default=10)
+    
+    args = parser.parse_args()
+    
+    # Create scraper instance with configured parameters
+    scraper = NewsScraper(
+        base_url=args.url,
+        output_file=args.output,
+        timeout=args.timeout
+    )
+    
+    # Run scraper
+    success = scraper.scrape(max_pages=args.pages, delay=args.delay)
+    
+    if success:
+        logger.info("Scraping completed successfully!")
+    else:
+        logger.error("Scraping completed with errors!")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
