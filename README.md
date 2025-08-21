@@ -1,20 +1,27 @@
 # News Scraper
 
-A flexible and robust Python web scraper to extract news articles from websites like India Today and others. Supports:
+A **flexible and robust Python web scraper** to extract news articles from websites like **India Today** and others. It supports:
 
-- Multiple page scraping
+- Multi-page scraping
 - Automatic retries and error handling
-- CSV output with logging
+- CSV output for collected articles
+- Logging for debugging and tracking
 - Extensible for multiple news websites
 
 ---
 
-## Features
+## 🔹 Features
 
-- Fetches web pages with retry logic
-- Parses HTML with BeautifulSoup and lxml
-- Extracts headlines, content, links, timestamp, and source
-- Saves results to CSV files
-- Supports pagination and delay between requests
+- Fetches web pages with **retry logic** and **timeout handling**  
+- Parses HTML with **BeautifulSoup** and **lxml**  
+- Extracts:
+  - Headlines
+  - Article content/summary
+  - Links
+  - Timestamp
+  - Source domain
+- Saves data to **CSV files**  
+- Supports **pagination** and respectful delays between requests  
+- Logs all actions and errors for easy debugging
 
 ---
